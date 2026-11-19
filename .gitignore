@@ -1,0 +1,56 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---------- 测试与类型检查缓存 ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- 环境变量（含 TuShare token） ----------
+.env
+.env.local
+.env.*.local
+
+# ---------- 数据目录 ----------
+# 本地行情数据、元数据库、派生快照不入库；离线样本保留
+data/raw/
+data/meta/
+data/snapshots/
+data/*.db
+data/*.sqlite
+*.parquet
+*.tmp
+
+# 离线演示样本需要随仓库提交
+#!data/samples/**
+
+# ---------- 前端 ----------
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- 编辑器 / 系统 ----------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---------- 日志 ----------
+logs/
+*.log
