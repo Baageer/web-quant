@@ -27,10 +27,13 @@ htmlcov/
 data/raw/
 data/meta/
 data/snapshots/
+data/backtest/
 data/*.db
 data/*.sqlite
 *.parquet
 *.tmp
+
+docs/
 
 # 离线演示样本需要随仓库提交
 #!data/samples/**
@@ -54,3 +57,4 @@ Thumbs.db
 # ---------- 日志 ----------
 logs/
 *.log
+

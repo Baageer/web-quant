@@ -1,5 +1,13 @@
 import type {
   ApiErrorBody,
+  BacktestAuditData,
+  BacktestAuditRequest,
+  BacktestNav,
+  BacktestRequest,
+  BacktestRunDetail,
+  BacktestRunStatus,
+  BacktestRunSummary,
+  BacktestTrades,
   ConfigData,
   DataStatus,
   Envelope,
@@ -26,8 +34,18 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string): Promise<T> {
-  const response = await fetch(`${BASE}${path}`);
+interface RequestOptions {
+  method?: "GET" | "POST";
+  body?: unknown;
+}
+
+async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const init: RequestInit = { method: options.method ?? "GET" };
+  if (options.body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(options.body);
+  }
+  const response = await fetch(`${BASE}${path}`, init);
   let body: unknown;
   try {
     body = await response.json();
@@ -125,5 +143,32 @@ export const api = {
     if (params.date) search.set("date", params.date);
     if (params.limit != null) search.set("limit", String(params.limit));
     return request(`/api/signal/batch?${search.toString()}`);
+  },
+  runBacktest(payload: BacktestRequest): Promise<Envelope<BacktestRunSummary>> {
+    return request("/api/backtest/run", { method: "POST", body: payload });
+  },
+  backtestStatus(runId: string): Promise<Envelope<BacktestRunStatus>> {
+    return request(`/api/backtest/${encodeURIComponent(runId)}/status`);
+  },
+  backtestDetail(runId: string): Promise<Envelope<BacktestRunDetail>> {
+    return request(`/api/backtest/${encodeURIComponent(runId)}`);
+  },
+  backtestNav(runId: string): Promise<Envelope<BacktestNav>> {
+    return request(`/api/backtest/${encodeURIComponent(runId)}/nav`);
+  },
+  backtestTrades(runId: string): Promise<Envelope<BacktestTrades>> {
+    return request(`/api/backtest/${encodeURIComponent(runId)}/trades`);
+  },
+  backtestAudit(runId: string): Promise<Envelope<BacktestAuditData>> {
+    return request(`/api/backtest/${encodeURIComponent(runId)}/audit`);
+  },
+  runBacktestAudit(
+    runId: string,
+    payload: BacktestAuditRequest = {},
+  ): Promise<Envelope<BacktestAuditData>> {
+    return request(`/api/backtest/${encodeURIComponent(runId)}/audit`, {
+      method: "POST",
+      body: payload,
+    });
   },
 };

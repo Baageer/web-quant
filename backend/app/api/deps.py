@@ -8,6 +8,7 @@ from functools import lru_cache
 from app.core.config import get_settings
 from app.data.calendar import TradeCalendar
 from app.data.repository import Repository
+from app.services.backtest_service import BacktestService
 from app.services.kline_service import KlineService
 from app.services.market_service import MarketService
 from app.services.radar_service import RadarService
@@ -24,6 +25,7 @@ class Services:
     radar: RadarService
     kline: KlineService
     signal: SignalService
+    backtest: BacktestService
 
 
 @lru_cache(maxsize=1)
@@ -36,6 +38,7 @@ def build_services() -> Services:
     radar = RadarService(settings, repository, calendar, refresh)
     kline = KlineService(settings, repository, calendar)
     signal = SignalService(settings, repository, calendar, kline)
+    backtest = BacktestService(settings, repository, calendar)
     return Services(
         repository=repository,
         calendar=calendar,
@@ -44,6 +47,7 @@ def build_services() -> Services:
         radar=radar,
         kline=kline,
         signal=signal,
+        backtest=backtest,
     )
 
 

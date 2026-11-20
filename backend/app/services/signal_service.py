@@ -22,8 +22,6 @@ from app.data.frames import coerce_numeric
 from app.data.repository import Repository
 from app.data.universe import limit_threshold
 from app.domain.indicators import atr as atr_indicator
-from app.domain.indicators import boll as boll_indicator
-from app.domain.indicators import macd as macd_indicator
 from app.domain.indicators import rsi as rsi_indicator
 from app.domain.indicators import sma
 from app.models.schemas import (
@@ -36,6 +34,16 @@ from app.models.schemas import (
     SignalTradePlan,
     StockSignal,
 )
+from app.domain.trend_score import (
+    TREND_FACTORS,
+    WEEKLY_SKIP,
+    Thresholds,
+    component_scores,
+    confidence as score_confidence,
+    direction as score_direction,
+    signal_for,
+    weighted_score,
+)
 from app.services.kline_service import KlineContext, KlineService, resample_bars
 
 SIGNAL_LABELS = {
@@ -47,15 +55,6 @@ SIGNAL_LABELS = {
     "SELL": "卖出",
 }
 
-TREND_FACTORS: tuple[tuple[str, str, float], ...] = (
-    ("ma", "均线排列", 0.30),
-    ("macd", "MACD 动能", 0.20),
-    ("rsi", "RSI 强弱", 0.15),
-    ("boll", "布林位置", 0.15),
-    ("volume", "量价配合", 0.10),
-    ("relative_strength", "相对强度", 0.10),
-)
-
 CONSTRAINTS = [
     "T+1：当日买入最早下一交易日卖出",
     "涨停不可买入、跌停不可卖出",
@@ -63,8 +62,6 @@ CONSTRAINTS = [
     "费用：佣金万 2.5（最低 5 元）、印花税卖出 0.05%、过户费 0.001%",
     "信号基于收盘数据生成，最早下一交易日开盘执行，不以当日收盘价成交",
 ]
-
-WEEKLY_SKIP = {"relative_strength"}
 
 
 @dataclass(frozen=True)
@@ -147,10 +144,11 @@ class SignalService:
             else "相对强度数据不足，按中性处理"
         )
 
-        daily_components = self._component_scores(daily, (rs_score, rs_reason))
-        weekly_components = self._component_scores(weekly, None)
-        daily_score, breakdown = self._weighted_score(daily_components, skip=set())
-        weekly_score, _ = self._weighted_score(weekly_components, skip=WEEKLY_SKIP)
+        daily_components = component_scores(daily, (rs_score, rs_reason))
+        weekly_components = component_scores(weekly, None)
+        daily_score, breakdown_parts = weighted_score(daily_components, skip=set())
+        weekly_score, _ = weighted_score(weekly_components, skip=WEEKLY_SKIP)
+        breakdown = [ScorePart(**part) for part in breakdown_parts]
 
         weights = self._config.timeframes
         total = round(
@@ -183,8 +181,8 @@ class SignalService:
             score=score,
             signal=signal,
             signal_label=signal_label,
-            confidence=round(self._confidence(score, not data_warnings), 1),
-            direction=self._direction(score),
+            confidence=round(score_confidence(score, not data_warnings), 1),
+            direction=score_direction(score),
             market_state=self._market_state(daily, daily_score),
             daily_score=daily_score,
             weekly_score=weekly_score,
@@ -262,162 +260,19 @@ class SignalService:
 
     # ---- 评分 ----
 
-    def _component_scores(
-        self,
-        bars: pd.DataFrame,
-        rs: tuple[float, str] | None,
-    ) -> dict[str, tuple[float, str]]:
-        closes = bars["close"].astype(float)
-        close = float(closes.iloc[-1])
-        components: dict[str, tuple[float, str]] = {}
-
-        ma5, ma10 = _last(sma(closes, 5)), _last(sma(closes, 10))
-        ma20, ma60 = _last(sma(closes, 20)), _last(sma(closes, 60))
-        if any(math.isnan(value) for value in (ma5, ma10, ma20, ma60)):
-            components["ma"] = (0.0, "均线数据不足，按中性处理")
-        elif close > ma5 > ma10 > ma20 > ma60:
-            components["ma"] = (1.0, "均线多头排列")
-        elif close > ma20 and close > ma60:
-            components["ma"] = (0.6, "收盘价站上 MA20 与 MA60")
-        elif close < ma20 and close < ma60:
-            components["ma"] = (-1.0, "收盘价跌破 MA20 与 MA60")
-        else:
-            components["ma"] = (0.0, "均线缠绕，方向不明")
-
-        macd_frame = macd_indicator(closes)
-        hist_now = _last(macd_frame["hist"])
-        hist_prev = _last(macd_frame["hist"].shift(1))
-        if math.isnan(hist_now) or math.isnan(hist_prev):
-            components["macd"] = (0.0, "MACD 数据不足")
-        elif hist_now > 0 and hist_now >= hist_prev:
-            components["macd"] = (1.0, "MACD 红柱放大")
-        elif hist_now > 0:
-            components["macd"] = (0.3, "MACD 红柱缩短")
-        elif hist_now < 0 and hist_now < hist_prev:
-            components["macd"] = (-1.0, "MACD 绿柱放大")
-        else:
-            components["macd"] = (-0.3, "MACD 绿柱缩短")
-
-        rsi_value = _last(rsi_indicator(closes))
-        components["rsi"] = self._rsi_component(rsi_value)
-
-        boll_frame = boll_indicator(closes)
-        upper = _last(boll_frame["upper"])
-        middle = _last(boll_frame["middle"])
-        lower = _last(boll_frame["lower"])
-        if any(math.isnan(value) for value in (upper, middle, lower)):
-            components["boll"] = (0.0, "布林带数据不足")
-        elif close >= upper * 0.999:
-            components["boll"] = (0.5, "触及布林上轨")
-        elif close <= lower * 1.001:
-            components["boll"] = (-0.5, "触及布林下轨")
-        elif close > middle:
-            components["boll"] = (0.2, "运行于布林中轨上方")
-        else:
-            components["boll"] = (-0.2, "运行于布林中轨下方")
-
-        components["volume"] = self._volume_component(bars)
-        if rs is None:
-            components["relative_strength"] = (0.0, "周线相对强度按中性处理")
-        else:
-            components["relative_strength"] = rs
-        return components
-
-    @staticmethod
-    def _rsi_component(value: float) -> tuple[float, str]:
-        if math.isnan(value):
-            return 0.0, "RSI 数据不足"
-        if 50 <= value < 70:
-            return 0.6, f"RSI {value:.1f}，处于强势区"
-        if 40 <= value < 50:
-            return 0.2, f"RSI {value:.1f}，动能温和"
-        if 70 <= value <= 80:
-            return 0.1, f"RSI {value:.1f}，接近超买"
-        if value > 80:
-            return -0.6, f"RSI {value:.1f}，超买风险"
-        if 30 <= value < 40:
-            return -0.2, f"RSI {value:.1f}，动能偏弱"
-        return -0.8, f"RSI {value:.1f}，超卖区"
-
-    @staticmethod
-    def _volume_component(bars: pd.DataFrame) -> tuple[float, str]:
-        volumes = bars["vol"].astype(float)
-        volume = _last(volumes)
-        base = _last(sma(volumes, 5))
-        pct = _number(bars["pct_chg"].iloc[-1])
-        if math.isnan(volume) or math.isnan(base) or base <= 0:
-            return 0.0, "量能数据不足"
-        ratio = volume / base
-        if pct > 0 and ratio >= 1.2:
-            return 1.0, f"放量上涨，量能 {ratio:.2f} 倍"
-        if pct > 0 and ratio < 0.8:
-            return 0.3, f"缩量上涨，量能 {ratio:.2f} 倍"
-        if pct < 0 and ratio >= 1.2:
-            return -1.0, f"放量下跌，量能 {ratio:.2f} 倍"
-        if pct < 0 and ratio < 0.8:
-            return -0.3, f"缩量下跌，量能 {ratio:.2f} 倍"
-        return 0.0, f"量能平稳，量比 {ratio:.2f}"
-
-    def _weighted_score(
-        self,
-        components: dict[str, tuple[float, str]],
-        *,
-        skip: set[str],
-    ) -> tuple[float, list[ScorePart]]:
-        effective = {
-            key: weight
-            for key, _, weight in TREND_FACTORS
-            if key not in skip
-        }
-        total_weight = sum(effective.values()) or 1.0
-        score = 0.0
-        parts: list[ScorePart] = []
-        for key, label, weight in TREND_FACTORS:
-            if key not in effective:
-                continue
-            raw, reason = components.get(key, (0.0, "缺少数据"))
-            contribution = 100.0 * weight / total_weight * raw
-            score += contribution
-            parts.append(
-                ScorePart(
-                    factor=key,
-                    label=label,
-                    weight=round(weight / total_weight, 3),
-                    raw=round(raw, 3),
-                    contribution=round(contribution, 2),
-                    reason=reason,
-                )
-            )
-        return round(score, 2), parts
-
     def _signal_for(self, score: float) -> tuple[str, str]:
         config = self._config
-        if score >= config.strong_buy:
-            key = "STRONG_BUY"
-        elif score >= config.buy:
-            key = "BUY"
-        elif score >= config.watch:
-            key = "WATCH"
-        elif score > config.hold:
-            key = "HOLD"
-        elif score > config.reduce:
-            key = "REDUCE"
-        else:
-            key = "SELL"
+        key = signal_for(
+            score,
+            Thresholds(
+                strong_buy=config.strong_buy,
+                buy=config.buy,
+                watch=config.watch,
+                hold=config.hold,
+                reduce=config.reduce,
+            ),
+        )
         return key, SIGNAL_LABELS[key]
-
-    @staticmethod
-    def _direction(score: float) -> str:
-        if score >= 10:
-            return "bullish"
-        if score <= -10:
-            return "bearish"
-        return "neutral"
-
-    @staticmethod
-    def _confidence(score: float, data_complete: bool) -> float:
-        value = 35.0 + 0.45 * abs(score) + (10.0 if data_complete else 0.0)
-        return float(np.clip(value, 25.0, 95.0))
 
     @staticmethod
     def _market_state(daily: pd.DataFrame, daily_score: float) -> str:

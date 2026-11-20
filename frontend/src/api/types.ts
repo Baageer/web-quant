@@ -302,3 +302,201 @@ export interface SignalBatch {
   tradeDate: string;
   items: SignalBatchItem[];
 }
+
+// ---- 回测（P4.4） ----
+
+export interface BacktestRequest {
+  startDate: string;
+  endDate: string;
+  strategy: string;
+  params: Record<string, unknown>;
+  initialCash?: number;
+  maxPositions?: number;
+  maxPosition?: number;
+  maxIndustry?: number;
+  maxTurnover?: number | null;
+}
+
+export interface BacktestRunSummary {
+  runId: string;
+  status: string;
+  strategy: string;
+  startDate: string;
+  endDate: string;
+  actualStart?: string | null;
+  actualEnd?: string | null;
+  initialCash: number;
+  finalValue: number;
+  totalReturn: number;
+  tradeCount: number;
+  warnings: string[];
+}
+
+export interface BacktestRunStatus {
+  runId: string;
+  status: string;
+  error?: string | null;
+  createdAt?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
+export interface BacktestManifest {
+  run_id?: string;
+  status?: string;
+  strategy?: string;
+  start_date?: string;
+  end_date?: string;
+  actual_start?: string | null;
+  actual_end?: string | null;
+  params?: Record<string, unknown>;
+  initial_cash?: number;
+  engine_version?: string;
+  verdict?: string;
+  audited_at?: string;
+  warnings?: string[];
+  error?: string | null;
+}
+
+export interface BacktestMetrics {
+  total_return: number;
+  annual_return: number;
+  annual_volatility: number;
+  sharpe: number;
+  sortino: number;
+  max_drawdown: number;
+  max_drawdown_days: number;
+  calmar: number;
+  final_value: number;
+  years: number;
+  trade_count: number;
+  filled_count: number;
+  rejected_count: number;
+  expired_count: number;
+  win_rate: number;
+  profit_factor: number;
+  profit_loss_ratio: number;
+  avg_holding_days: number;
+  total_fees: number;
+  fee_ratio: number;
+  turnover_rate: number;
+  rejection_reasons: Record<string, number>;
+  suspension_deferrals: number;
+  benchmark_return: number;
+  excess_return: number;
+  tracking_error: number;
+  information_ratio: number;
+  alpha: number;
+  beta: number;
+  monthly_returns: Record<string, number>;
+  yearly_returns: Record<string, number>;
+}
+
+export interface BacktestRunDetail {
+  runId: string;
+  manifest: BacktestManifest;
+  metrics: BacktestMetrics;
+}
+
+export interface BacktestNavPoint {
+  date: string;
+  portfolio_value: number;
+  nav: number;
+  cash: number;
+  cash_ratio: number;
+  daily_return: number;
+  drawdown: number;
+}
+
+export interface BacktestNav {
+  runId: string;
+  items: BacktestNavPoint[];
+}
+
+export interface BacktestTrade {
+  date: string;
+  signal_date: string;
+  ts_code: string;
+  action: string;
+  status: string;
+  rejection_reason: string;
+  shares: number;
+  price: number;
+  amount: number;
+  commission: number;
+  stamp_duty: number;
+  transfer_fee: number;
+  slippage_cost: number;
+  profit: number;
+  reason: string;
+}
+
+export interface BacktestTrades {
+  runId: string;
+  items: BacktestTrade[];
+}
+
+export interface BacktestAuditTrial {
+  params: Record<string, unknown>;
+  sharpe: number;
+  total_return: number;
+  max_drawdown: number;
+  trade_count: number;
+}
+
+export interface BacktestAudit {
+  created_at: string;
+  strategy: string;
+  start_date: string;
+  end_date: string;
+  params: Record<string, unknown>;
+  thresholds: Record<string, number>;
+  trials: {
+    count: number;
+    configs: string[];
+    details: BacktestAuditTrial[];
+  };
+  observed: {
+    label: string;
+    sharpe: number;
+    trading_days: number;
+  };
+  pbo: {
+    pbo: number;
+    combinations: number;
+    configs: number;
+    blocks: number;
+  };
+  cpcv: {
+    splits: number;
+    mean_test_sharpe: number;
+    std_test_sharpe: number;
+    positive_ratio: number;
+    paths: { split: number; selected: string; train_sharpe: number; test_sharpe: number }[];
+    selected: Record<string, number>;
+  };
+  dsr: {
+    dsr: number;
+    z: number;
+    sr0: number;
+    haircut_sharpe: number;
+    observed_sharpe: number;
+    trials: number;
+  };
+  verdict: "accepted" | "rejected";
+  reasons: string[];
+  notes: string[];
+}
+
+export interface BacktestAuditData {
+  runId: string;
+  audit: BacktestAudit;
+}
+
+export interface BacktestAuditRequest {
+  paramGrid?: Record<string, unknown[]>;
+  thresholds?: Record<string, number>;
+  nBlocks?: number;
+  nTestBlocks?: number;
+  purgeBlocks?: number;
+}

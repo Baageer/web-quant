@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -326,3 +326,77 @@ class ConfigData(CamelModel):
 class RefreshResult(CamelModel):
     trade_date: str
     datasets: list[dict] = Field(default_factory=list)
+
+
+# ---- 回测（P4.0） ----
+
+
+class BacktestRequest(CamelModel):
+    start_date: str
+    end_date: str
+    strategy: str = "ma_cross"
+    params: dict[str, Any] = Field(default_factory=dict)
+    initial_cash: float = 1_000_000.0
+    symbols: list[str] | None = None
+    max_positions: int = 20
+    max_position: float = 0.10
+    max_industry: float = 0.30
+    max_turnover: float | None = None
+
+
+class BacktestRunSummary(CamelModel):
+    run_id: str
+    status: str
+    strategy: str
+    start_date: str
+    end_date: str
+    actual_start: str | None = None
+    actual_end: str | None = None
+    initial_cash: float
+    final_value: float
+    total_return: float
+    trade_count: int
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BacktestRunDetail(CamelModel):
+    run_id: str
+    manifest: dict[str, Any]
+    metrics: dict[str, Any]
+
+
+class BacktestRunStatus(CamelModel):
+    run_id: str
+    status: str
+    error: str | None = None
+    created_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+class BacktestAuditRequest(CamelModel):
+    param_grid: dict[str, list[Any]] | None = None
+    thresholds: dict[str, float] | None = None
+    n_blocks: int = 8
+    n_test_blocks: int = 2
+    purge_blocks: int = 1
+
+
+class BacktestAuditData(CamelModel):
+    run_id: str
+    audit: dict[str, Any]
+
+
+class BacktestRunList(CamelModel):
+    total: int
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class BacktestNavData(CamelModel):
+    run_id: str
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class BacktestTradeData(CamelModel):
+    run_id: str
+    items: list[dict[str, Any]] = Field(default_factory=list)

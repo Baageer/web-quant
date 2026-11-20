@@ -40,6 +40,11 @@ class ModeNotAllowedError(AppError):
     status_code = 409
 
 
+class RunNotFoundError(AppError):
+    code = "RUN_NOT_FOUND"
+    status_code = 404
+
+
 class TushareConfigError(AppError):
     code = "TUSHARE_NOT_CONFIGURED"
     status_code = 503

@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { key: "/market", label: "行情" },
   { key: "/radar", label: "机会雷达" },
   { key: "/kline", label: "K 线与信号" },
+  { key: "/backtest", label: "回测" },
 ];
 
 export default function MainLayout() {

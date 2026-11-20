@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -9,8 +12,26 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
-os.environ.setdefault("WEB_QUANT_MODE", "offline")
-os.environ.setdefault("WEB_QUANT_DATA_DIR", str(ROOT / "data"))
+SAMPLES_SRC = ROOT / "data" / "samples"
+
+
+def _isolated_data_dir() -> Path:
+    """测试只使用离线样本，隔离本机 data/raw 与 .env 的影响。"""
+    if not SAMPLES_SRC.exists():
+        return ROOT / "data"
+    target = Path(tempfile.mkdtemp(prefix="web_quant_test_data_"))
+    shutil.copytree(SAMPLES_SRC, target / "samples")
+    atexit.register(shutil.rmtree, target, True)
+    return target
+
+
+TEST_DATA_DIR = _isolated_data_dir()
+
+# 直接赋值而不是 setdefault：显式覆盖 .env 中的 auto 模式、真实数据目录与 token
+os.environ["WEB_QUANT_MODE"] = "offline"
+os.environ["WEB_QUANT_DATA_DIR"] = str(TEST_DATA_DIR)
+os.environ["WEB_QUANT_DB"] = str(TEST_DATA_DIR / "meta" / "test.db")
+os.environ["TS_TOKEN"] = ""
 
 from app.core.config import build_settings  # noqa: E402
 from app.data.calendar import TradeCalendar  # noqa: E402

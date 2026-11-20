@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.api.routes_backtest import router as backtest_router
 from app.api.routes_data import router as data_router
 from app.api.routes_kline import router as kline_router
 from app.api.routes_market import router as market_router
@@ -40,6 +41,7 @@ app.include_router(market_router)
 app.include_router(radar_router)
 app.include_router(kline_router)
 app.include_router(data_router)
+app.include_router(backtest_router)
 
 
 @app.exception_handler(AppError)
