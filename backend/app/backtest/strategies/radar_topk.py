@@ -30,6 +30,7 @@ DEFAULT_PARAMS = {
 
 class RadarTopKStrategy:
     name = "radar_topk"
+    requires_flow = True
 
     def __init__(self) -> None:
         self.params: dict = dict(DEFAULT_PARAMS)

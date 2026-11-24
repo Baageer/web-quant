@@ -24,6 +24,7 @@ DEFAULT_PARAMS = {
 
 class MaCrossStrategy:
     name = "ma_cross"
+    requires_flow = False
 
     def __init__(self) -> None:
         self.params: dict = dict(DEFAULT_PARAMS)

@@ -27,6 +27,7 @@ REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     "moneyflow": ("ts_code", "trade_date", "net_mf_amount"),
     "limit_list": ("ts_code", "trade_date", "limit_type"),
     "suspend": ("ts_code", "trade_date", "suspend_type"),
+    "fina_indicator": ("ts_code", "ann_date", "end_date"),
 }
 
 # 行数下限，低于该值视为明显不完整
@@ -36,6 +37,26 @@ MIN_ROWS: dict[str, int] = {
     "adj_factor": 3000,
     "index_daily": 3,
 }
+
+# 2018 年前 A 股上市公司不足 3000 家（2017 年才首次站上 3000），全市场下限按早期规模校验
+EARLY_MARKET_CUTOFF = "20180101"
+EARLY_MIN_ROWS: dict[str, int] = {
+    "daily": 2000,
+    "daily_basic": 1500,
+    "adj_factor": 2000,
+}
+
+
+def _min_rows(dataset: str, trade_date: str | None) -> int | None:
+    floor = MIN_ROWS.get(dataset)
+    if floor is None:
+        return None
+    if trade_date is not None:
+        day = str(trade_date).replace("-", "")
+        early = EARLY_MIN_ROWS.get(dataset)
+        if early is not None and day < EARLY_MARKET_CUTOFF:
+            return early
+    return floor
 
 
 def validate_dataset(
@@ -65,7 +86,7 @@ def validate_dataset(
         if dates and dates != {trade_date}:
             return False, f"trade_date_mismatch:{','.join(sorted(dates))}"
 
-    min_rows = MIN_ROWS.get(dataset)
+    min_rows = _min_rows(dataset, trade_date)
     if min_rows is not None and len(frame) < min_rows and not allow_empty and not allow_small:
         return False, f"too_few_rows:{len(frame)}<{min_rows}"
 

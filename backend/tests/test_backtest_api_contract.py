@@ -86,6 +86,9 @@ def test_run_and_query_contract(client):
     metrics = detail_body["data"]["metrics"]
     assert manifest["status"] == "completed"
     assert manifest["actual_start"] >= "20260401"
+    assert "stale_data" in manifest
+    assert detail_body["stale"] == manifest["stale_data"]
+    assert manifest["config"]["rebalance"] == "daily"
     assert metrics["trade_count"] > 0
     for key in (
         "run_id",
@@ -162,5 +165,41 @@ def test_reversed_dates_returns_invalid_param(client):
         "/api/backtest/run",
         json=_run_payload(startDate="2026-09-30", endDate="2026-04-01"),
     )
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_PARAM"
+
+
+def test_invalid_rebalance_returns_invalid_param(client):
+    response = client.post("/api/backtest/run", json=_run_payload(rebalance="hourly"))
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_PARAM"
+
+
+def test_invalid_stop_loss_returns_invalid_param(client):
+    response = client.post("/api/backtest/run", json=_run_payload(stopLoss=1.5))
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_PARAM"
+
+
+def test_negative_take_profit_returns_invalid_param(client):
+    response = client.post("/api/backtest/run", json=_run_payload(takeProfit=-0.1))
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_PARAM"
+
+
+def test_invalid_atr_window_returns_invalid_param(client):
+    response = client.post("/api/backtest/run", json=_run_payload(atrWindow=1))
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_PARAM"
+
+
+def test_negative_atr_multiple_returns_invalid_param(client):
+    response = client.post("/api/backtest/run", json=_run_payload(atrTakeProfit=-1))
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_PARAM"
+
+
+def test_invalid_stop_cooldown_returns_invalid_param(client):
+    response = client.post("/api/backtest/run", json=_run_payload(stopCooldown="day"))
     assert response.status_code == 400
     assert response.json()["error"] == "INVALID_PARAM"

@@ -36,6 +36,7 @@ DATASET_LAYOUT: dict[str, tuple[str, bool, bool]] = {
     "limit_list": ("limit_list", False, True),
     "index_daily": ("index_daily", False, False),
     "suspend": ("suspend", False, True),
+    "fina_indicator": ("fina_indicator", True, True),
 }
 
 RAW_ORIGIN = "tushare"

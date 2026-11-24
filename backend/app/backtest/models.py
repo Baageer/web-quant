@@ -38,6 +38,27 @@ REASON_INVALID_PRICE = "invalid_price"
 
 ACTION_BUY = "buy"
 ACTION_SELL = "sell"
+ACTION_STOP = "stop_sell"  # 止盈止损触发的清仓单
+
+# ---- 风控退出原因 ----
+
+EXIT_STOP_LOSS = "stop_loss"
+EXIT_TAKE_PROFIT = "take_profit"
+EXIT_ATR_TRAIL = "atr_trailing"
+
+# ---- 调仓频率 ----
+
+REBALANCE_DAILY = "daily"
+REBALANCE_WEEKLY = "weekly"
+REBALANCE_MONTHLY = "monthly"
+REBALANCE_MODES = (REBALANCE_DAILY, REBALANCE_WEEKLY, REBALANCE_MONTHLY)
+
+# ---- 止损后重新入场冷却 ----
+
+COOLDOWN_NONE = "none"
+COOLDOWN_WEEK = "week"
+COOLDOWN_MONTH = "month"
+COOLDOWN_MODES = (COOLDOWN_NONE, COOLDOWN_WEEK, COOLDOWN_MONTH)
 
 # trades.parquet 列契约（顺序即落盘顺序）
 TRADE_COLUMNS = [
@@ -148,9 +169,36 @@ class BacktestConfig:
     max_industry: float = 0.30
     max_turnover: float | None = None
     rebalance: str = "daily"
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    atr_window: int = 14
+    atr_take_profit: float = 0.0
+    stop_cooldown: str = "none"
     fees: FeeConfig = field(default_factory=FeeConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
+
+    def __post_init__(self) -> None:
+        mode = str(self.rebalance or REBALANCE_DAILY).strip().lower()
+        if mode not in REBALANCE_MODES:
+            raise ValueError(
+                f"未知调仓频率：{self.rebalance}，可选 {', '.join(REBALANCE_MODES)}"
+            )
+        object.__setattr__(self, "rebalance", mode)
+        if not 0.0 <= float(self.stop_loss) < 1.0:
+            raise ValueError("stop_loss 必须在 [0, 1) 区间，0 表示关闭")
+        if float(self.take_profit) < 0.0:
+            raise ValueError("take_profit 必须大于等于 0，0 表示关闭")
+        if int(self.atr_window) < 2:
+            raise ValueError("atr_window 必须大于等于 2")
+        if float(self.atr_take_profit) < 0.0:
+            raise ValueError("atr_take_profit 必须大于等于 0，0 表示关闭")
+        cooldown = str(self.stop_cooldown or COOLDOWN_NONE).strip().lower()
+        if cooldown not in COOLDOWN_MODES:
+            raise ValueError(
+                f"未知止损冷却周期：{self.stop_cooldown}，可选 {', '.join(COOLDOWN_MODES)}"
+            )
+        object.__setattr__(self, "stop_cooldown", cooldown)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -165,6 +213,11 @@ class BacktestConfig:
             "max_industry": self.max_industry,
             "max_turnover": self.max_turnover,
             "rebalance": self.rebalance,
+            "stop_loss": self.stop_loss,
+            "take_profit": self.take_profit,
+            "atr_window": self.atr_window,
+            "atr_take_profit": self.atr_take_profit,
+            "stop_cooldown": self.stop_cooldown,
             "fees": {
                 "commission_rate": self.fees.commission_rate,
                 "commission_min": self.fees.commission_min,
@@ -189,7 +242,8 @@ class Order:
     """目标权重订单。
 
     action="target"    按 target_weight 调整到目标仓位（可买可卖）；
-    action="sell_all"  清仓。
+    action="sell_all"  清仓；
+    action="stop_sell" 止盈止损触发的清仓，优先级高于同票调仓单。
     """
 
     ts_code: str
@@ -199,6 +253,7 @@ class Order:
     eligible_date: str | None = None
     ttl_days: int = 1
     attempts: int = 0
+    note: str = ""
 
 
 @dataclass

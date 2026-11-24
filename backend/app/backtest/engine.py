@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Iterable
 
 import pandas as pd
@@ -17,6 +18,12 @@ from app.backtest.data_loader import Panel
 from app.backtest.models import (
     ACTION_BUY,
     ACTION_SELL,
+    ACTION_STOP,
+    COOLDOWN_MONTH,
+    COOLDOWN_NONE,
+    EXIT_ATR_TRAIL,
+    EXIT_STOP_LOSS,
+    EXIT_TAKE_PROFIT,
     NAV_COLUMNS,
     ORDER_EXPIRED,
     ORDER_FILLED,
@@ -27,6 +34,8 @@ from app.backtest.models import (
     REASON_SIGNAL_EXPIRED,
     REASON_SUSPENDED,
     REASON_T_PLUS_ONE,
+    REBALANCE_DAILY,
+    REBALANCE_WEEKLY,
     TRADE_COLUMNS,
     BacktestConfig,
     EngineOutput,
@@ -43,6 +52,32 @@ class LookaheadError(RuntimeError):
     """成交日期不晚于信号日期时抛出。"""
 
 
+def _is_rebalance_day(mode: str, dates: list[str], index: int) -> bool:
+    """判断 index 是否为调仓日（见 §7.2）。
+
+    周/月调仓取交易日历中该周/月的最后一个交易日生成信号，
+    仍由引擎延迟到下一交易日开盘成交。
+    """
+    if mode == REBALANCE_DAILY:
+        return True
+    if index + 1 >= len(dates):
+        return True
+    current = _trade_day(dates[index])
+    following = _trade_day(dates[index + 1])
+    if current is None or following is None:
+        return True
+    if mode == REBALANCE_WEEKLY:
+        return current.isocalendar()[:2] != following.isocalendar()[:2]
+    return (current.year, current.month) != (following.year, following.month)
+
+
+def _trade_day(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(str(value).replace("-", ""), "%Y%m%d")
+    except ValueError:
+        return None
+
+
 class BacktestEngine:
     def __init__(self, panel: Panel, strategy: Strategy, config: BacktestConfig) -> None:
         self.panel = panel
@@ -50,6 +85,9 @@ class BacktestEngine:
         self.config = config
         self.broker = Broker(config.fees, config.execution)
         self._warnings: list[str] = []
+        self._peaks: dict[str, float] = {}
+        self._cooldown: dict[str, str] = {}
+        self._cooldown_blocks = 0
 
     # ---- 主循环 ----
 
@@ -67,6 +105,8 @@ class BacktestEngine:
         ignored_short = 0
 
         for index, date in enumerate(dates):
+            if index > 0:
+                self._adjust_corporate_actions(dates[index - 1], date, portfolio)
             portfolio.settle()
             if pending:
                 pending = self._execute(pending, date, portfolio, trades)
@@ -91,6 +131,12 @@ class BacktestEngine:
 
             if index + 1 >= len(dates):
                 break
+            self._sync_peaks(portfolio, closes)
+            pending = self._apply_risk_controls(
+                date, dates[index + 1], portfolio, closes, pending
+            )
+            if not _is_rebalance_day(self.config.rebalance, dates, index):
+                continue
             raw_target, ignored = self._sanitize(
                 self.strategy.signal(date, self.panel.as_of(date))
             )
@@ -117,6 +163,8 @@ class BacktestEngine:
 
         if ignored_short:
             self._warn(f"忽略 {ignored_short} 个做空/无效权重信号（P4 不支持下单）")
+        if self._cooldown_blocks:
+            self._warn(f"止损冷却期内过滤 {self._cooldown_blocks} 个买入信号")
         if not trades:
             self._warn("回测期内没有产生任何订单")
 
@@ -135,6 +183,102 @@ class BacktestEngine:
 
     # ---- 信号与下单 ----
 
+    def _adjust_corporate_actions(
+        self, previous: str, date: str, portfolio: Portfolio
+    ) -> None:
+        """按复权因子变化调整持股数量（见 §5.4）。
+
+        送转/分红除权后原始价格会跳变，若持股数不变会产生虚假亏损；
+        这里用 adj_factor 比值同步扩缩股份，使持仓市值连续。
+        """
+        if not portfolio.positions:
+            return
+        for code, position in list(portfolio.positions.items()):
+            before = self.panel.adj_factor(previous, code)
+            after = self.panel.adj_factor(date, code)
+            if before is None or after is None:
+                continue
+            ratio = after / before
+            if not (0.01 < ratio < 100) or abs(ratio - 1.0) < 1e-9:
+                continue
+            position.shares = int(round(position.shares * ratio))
+            position.available = position.shares
+            if position.shares <= 0:
+                portfolio.positions.pop(code, None)
+
+    def _sync_peaks(
+        self, portfolio: Portfolio, closes: dict[str, float]
+    ) -> None:
+        """维护持仓期内的最高收盘价，供 ATR 移动止盈使用。"""
+        held = {
+            code for code, position in portfolio.positions.items() if position.shares > 0
+        }
+        for code in list(self._peaks):
+            if code not in held:
+                del self._peaks[code]
+        for code in held:
+            close = closes.get(code)
+            if not close or close <= 0:
+                continue
+            previous = self._peaks.get(code)
+            self._peaks[code] = close if previous is None else max(previous, close)
+
+    def _apply_risk_controls(
+        self,
+        date: str,
+        eligible_date: str,
+        portfolio: Portfolio,
+        closes: dict[str, float],
+        pending: list[Order],
+    ) -> list[Order]:
+        """收盘后检查止损与止盈，触发则以次日开盘清仓（见 §7.3）。
+
+        止损为固定比例（相对持仓均价）；止盈支持固定比例与 ATR 移动止盈：
+        浮盈状态下，收盘价自持仓最高收盘价回撤 `atr_take_profit × ATR` 即清仓。
+        0 表示关闭，已存在同票风控单时不重复生成。
+        """
+        stop = float(self.config.stop_loss or 0.0)
+        take = float(self.config.take_profit or 0.0)
+        atr_multiple = float(self.config.atr_take_profit or 0.0)
+        if stop <= 0 and take <= 0 and atr_multiple <= 0:
+            return pending
+
+        waiting = {order.ts_code for order in pending if order.action == ACTION_STOP}
+        ttl = max(1, int(self.config.execution.signal_ttl_days))
+        for code, position in portfolio.positions.items():
+            if position.shares <= 0 or position.avg_cost <= 0 or code in waiting:
+                continue
+            close = closes.get(code)
+            if not close or close <= 0:
+                continue
+            pnl = close / position.avg_cost - 1.0
+            note = ""
+            if stop > 0 and pnl <= -stop:
+                note = EXIT_STOP_LOSS
+            elif take > 0 and pnl >= take:
+                note = EXIT_TAKE_PROFIT
+            elif atr_multiple > 0 and pnl > 0:
+                peak = self._peaks.get(code)
+                atr = self.panel.atr(date, code, int(self.config.atr_window))
+                if peak is not None and atr and atr > 0:
+                    if close <= peak - atr_multiple * atr:
+                        note = EXIT_ATR_TRAIL
+            if not note:
+                continue
+            waiting.add(code)
+            pending.append(
+                Order(
+                    ts_code=code,
+                    signal_date=date,
+                    action=ACTION_STOP,
+                    target_weight=0.0,
+                    eligible_date=eligible_date,
+                    ttl_days=ttl,
+                    note=note,
+                )
+            )
+        return pending
+
     def _sanitize(self, raw: dict[str, float] | None) -> tuple[dict[str, float], int]:
         """只保留有限的做多权重；组合约束由 constrain_targets 统一处理。"""
         target: dict[str, float] = {}
@@ -151,6 +295,13 @@ class BacktestEngine:
             target[str(code)] = value
         return target, ignored
 
+    def _cooldown_key(self, date: str) -> str:
+        """返回当前日期所属的冷却周期标识（自然月或 ISO 周）。"""
+        if self.config.stop_cooldown == COOLDOWN_MONTH:
+            return date[:6]
+        week = datetime.strptime(date, "%Y%m%d").isocalendar()
+        return f"{week[0]}-W{week[1]:02d}"
+
     def _make_orders(
         self,
         target: dict[str, float],
@@ -165,6 +316,11 @@ class BacktestEngine:
 
         # 停牌顺延的旧订单：目标未消失则保留，避免每天重复生成
         for order in pending:
+            if order.action == ACTION_STOP:
+                # 风控单优先于调仓单，保留到成交或过期
+                kept.append(order)
+                kept_codes.add(order.ts_code)
+                continue
             if constraints.is_suspended(self.panel.bar(signal_date, order.ts_code)):
                 # 当日停牌看不到新信号，按 TTL 顺延（见 §5.2）
                 kept.append(order)
@@ -176,6 +332,27 @@ class BacktestEngine:
                 continue
             kept.append(order)
             kept_codes.add(order.ts_code)
+
+        if self.config.stop_cooldown != COOLDOWN_NONE and target:
+            # 止损出局后，同一冷却周期内不再接收该标的的买入信号
+            bucket = self._cooldown_key(signal_date)
+            held = {
+                code
+                for code, position in portfolio.positions.items()
+                if position.shares > 0
+            }
+            blocked = {
+                code
+                for code, key in self._cooldown.items()
+                if key == bucket and code in target and code not in held
+            }
+            if blocked:
+                self._cooldown_blocks += len(blocked)
+                target = {
+                    code: weight
+                    for code, weight in target.items()
+                    if code not in blocked
+                }
 
         for code, weight in target.items():
             if code in kept_codes:
@@ -217,6 +394,9 @@ class BacktestEngine:
     ) -> list[Order]:
         remaining: list[Order] = []
         equity_open: float | None = None
+        bars: dict[str, pd.Series | None] = {}
+        sells: list[Order] = []
+        buys: list[Order] = []
 
         for order in pending:
             if order.eligible_date and date < order.eligible_date:
@@ -229,7 +409,7 @@ class BacktestEngine:
 
             code = order.ts_code
             bar = self.panel.bar(date, code)
-            name = None if bar is None else bar.get("name")
+            bars[code] = bar
             order.attempts += 1
 
             if constraints.is_suspended(bar):
@@ -251,22 +431,105 @@ class BacktestEngine:
 
             if equity_open is None:
                 equity_open = portfolio.equity(self.panel.open_prices(date))
-            open_price = float(bar["open"])
+            if self._is_reduce(order, float(bar["open"]), equity_open, portfolio):
+                sells.append(order)
+            else:
+                buys.append(order)
 
-            if order.action == "sell_all":
-                if self._handle_sell_all(
+        if equity_open is None:
+            return remaining
+
+        # 第一阶段：卖出/减仓，先回笼现金（见 §7.1 现金约束）
+        for order in sells:
+            bar = bars[order.ts_code]
+            name = None if bar is None else bar.get("name")
+            open_price = float(bar["open"])
+            if order.action in ("sell_all", ACTION_STOP):
+                keep = self._handle_sell_all(
                     order, bar, name, date, open_price, portfolio, trades
+                )
+                # 风控单遇跌停/停牌时在有效期内顺延，避免止损被一次拒单吞掉
+                if keep or (
+                    order.action == ACTION_STOP
+                    and order.attempts < max(1, order.ttl_days)
                 ):
                     remaining.append(order)
                 continue
-
-            kept = self._handle_target(
+            if self._handle_target(
                 order, bar, name, date, open_price, equity_open, portfolio, trades
-            )
-            if kept:
+            ):
+                remaining.append(order)
+
+        # 第二阶段：买入按可用现金统一缩放，避免尾单被逐笔拒单
+        scale = self._buy_scale(buys, equity_open, bars, portfolio)
+        for order in buys:
+            bar = bars[order.ts_code]
+            name = None if bar is None else bar.get("name")
+            open_price = float(bar["open"])
+            if self._handle_target(
+                order,
+                bar,
+                name,
+                date,
+                open_price,
+                equity_open,
+                portfolio,
+                trades,
+                scale=scale,
+            ):
                 remaining.append(order)
 
         return remaining
+
+    @staticmethod
+    def _is_reduce(
+        order: Order,
+        open_price: float,
+        equity_open: float,
+        portfolio: Portfolio,
+    ) -> bool:
+        """判断订单是否为卖出/减仓，用于排到买入之前执行。"""
+        if order.action in ("sell_all", ACTION_STOP):
+            return True
+        position = portfolio.positions.get(order.ts_code)
+        current = position.shares if position else 0
+        if current <= 0 or open_price <= 0:
+            return False
+        target_shares = constraints.round_lot(
+            equity_open * order.target_weight / open_price
+        )
+        return target_shares < current
+
+    def _buy_scale(
+        self,
+        orders: list[Order],
+        equity_open: float,
+        bars: dict[str, pd.Series | None],
+        portfolio: Portfolio,
+    ) -> float:
+        """目标名义额超过可用现金时按比例统一缩放（见 §7.1 Σ名义额 ≤ 可用现金）。"""
+        if not orders or equity_open <= 0:
+            return 1.0
+        rate = self.config.fees.commission_rate + self.config.fees.transfer_fee
+        investable = max(0.0, portfolio.cash) / (1.0 + rate)
+        need = 0.0
+        for order in orders:
+            bar = bars.get(order.ts_code)
+            if bar is None:
+                continue
+            open_price = float(bar["open"])
+            if open_price <= 0:
+                continue
+            price = self.broker.fill_price(open_price, ACTION_BUY)
+            position = portfolio.positions.get(order.ts_code)
+            current = position.shares if position else 0
+            target_shares = constraints.round_lot(
+                equity_open * order.target_weight / open_price
+            )
+            need += max(0, target_shares - current) * price
+        if need <= investable or need <= 0:
+            return 1.0
+        return investable / need
 
     def _handle_target(
         self,
@@ -278,6 +541,8 @@ class BacktestEngine:
         equity_open: float,
         portfolio: Portfolio,
         trades: list[TradeRecord],
+        *,
+        scale: float = 1.0,
     ) -> bool:
         """按目标权重调整仓位；返回 True 表示订单需要顺延。"""
         position = portfolio.positions.get(order.ts_code)
@@ -305,17 +570,21 @@ class BacktestEngine:
                 return False
             price = self.broker.fill_price(open_price, ACTION_BUY)
             wanted = target_shares - current
+            if scale < 1.0:
+                wanted = constraints.round_lot(wanted * scale)
             affordable = self.broker.max_affordable_shares(portfolio.cash, price)
             shares = min(wanted, affordable)
             if shares < constraints.LOT_SIZE:
-                trades.append(
-                    self._reject(
-                        order, date, ACTION_BUY, REASON_INSUFFICIENT_CASH, wanted
+                if scale >= 1.0:
+                    trades.append(
+                        self._reject(
+                            order, date, ACTION_BUY, REASON_INSUFFICIENT_CASH, wanted
+                        )
                     )
-                )
                 return False
             self._fill(order, date, ACTION_BUY, shares, price, open_price, portfolio, trades)
-            return False
+            # 现金不足导致的缩量在有效期内顺延，下一交易日继续补足
+            return shares < wanted and order.attempts < max(1, order.ttl_days)
 
         # 减仓 / 清仓
         reason = constraints.check_open_bar(bar, ACTION_SELL, order.ts_code, name)
@@ -405,8 +674,16 @@ class BacktestEngine:
                     shares, open_price, price, action
                 ),
                 profit=profit,
+                reason=order.note,
             )
         )
+        if (
+            action == ACTION_SELL
+            and order.action == ACTION_STOP
+            and order.note == EXIT_STOP_LOSS
+            and self.config.stop_cooldown != COOLDOWN_NONE
+        ):
+            self._cooldown[order.ts_code] = self._cooldown_key(date)
 
     def _reject(
         self,
@@ -423,6 +700,7 @@ class BacktestEngine:
             status=ORDER_REJECTED,
             reason=reason,
             shares=int(shares),
+            note=order.note,
         )
 
     def _record(
@@ -449,7 +727,7 @@ class BacktestEngine:
 
     @staticmethod
     def _fallback_action(order: Order, portfolio: Portfolio) -> str:
-        if order.action == "sell_all":
+        if order.action in ("sell_all", ACTION_STOP):
             return ACTION_SELL
         position = portfolio.positions.get(order.ts_code)
         return ACTION_SELL if position else ACTION_BUY

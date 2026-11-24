@@ -5,6 +5,7 @@ import type {
   BacktestNav,
   BacktestRequest,
   BacktestRunDetail,
+  BacktestRunList,
   BacktestRunStatus,
   BacktestRunSummary,
   BacktestTrades,
@@ -146,6 +147,12 @@ export const api = {
   },
   runBacktest(payload: BacktestRequest): Promise<Envelope<BacktestRunSummary>> {
     return request("/api/backtest/run", { method: "POST", body: payload });
+  },
+  backtestRuns(limit = 20, offset = 0): Promise<Envelope<BacktestRunList>> {
+    const search = new URLSearchParams();
+    search.set("limit", String(limit));
+    search.set("offset", String(offset));
+    return request(`/api/backtest/runs?${search.toString()}`);
   },
   backtestStatus(runId: string): Promise<Envelope<BacktestRunStatus>> {
     return request(`/api/backtest/${encodeURIComponent(runId)}/status`);

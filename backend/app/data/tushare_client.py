@@ -44,6 +44,11 @@ LIMIT_LIST_FIELDS = "trade_date,ts_code,industry,name,close,pct_chg,amount,limit
 SUSPEND_FIELDS = "ts_code,trade_date,suspend_type,suspend_timing"
 STOCK_BASIC_FIELDS = "ts_code,symbol,name,area,industry,market,list_date,list_status,delist_date"
 TRADE_CAL_FIELDS = "exchange,cal_date,is_open,pretrade_date"
+FINA_INDICATOR_FIELDS = (
+    "ts_code,ann_date,end_date,roe,roe_waa,roe_dt,roe_yearly,roa,roic,"
+    "grossprofit_margin,netprofit_margin,debt_to_assets,current_ratio,quick_ratio,"
+    "netprofit_yoy,or_yoy"
+)
 
 
 class RateLimiter:
@@ -85,20 +90,22 @@ class TushareClient:
         api_name: str,
         params: Mapping[str, Any] | None = None,
         fields: str = "",
+        *,
+        page_size: int = PAGE_SIZE,
     ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         offset = 0
         while True:
-            body = self._request(api_name, params or {}, fields, offset)
+            body = self._request(api_name, params or {}, fields, offset, page_size)
             data = body.get("data") or {}
             names = data.get("fields") or []
             items = data.get("items") or []
             if not items:
                 break
             frames.append(pd.DataFrame(items, columns=names))
-            if len(items) < PAGE_SIZE:
+            if len(items) < page_size:
                 break
-            offset += PAGE_SIZE
+            offset += page_size
         if not frames:
             return pd.DataFrame(columns=[f for f in fields.split(",") if f])
         return pd.concat(frames, ignore_index=True)
@@ -109,8 +116,9 @@ class TushareClient:
         params: Mapping[str, Any],
         fields: str,
         offset: int,
+        page_size: int = PAGE_SIZE,
     ) -> dict[str, Any]:
-        query = dict(params, limit=PAGE_SIZE, offset=offset)
+        query = dict(params, limit=page_size, offset=offset)
         payload = json.dumps(
             {"api_name": api_name, "token": self._token, "params": query, "fields": fields}
         ).encode("utf-8")
@@ -200,4 +208,19 @@ class TushareClient:
             "suspend_d",
             {"trade_date": trade_date, "suspend_type": "S"},
             SUSPEND_FIELDS,
+        )
+
+    def fina_indicator(
+        self, ts_code: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        """按股票拉取财务指标；该接口单页最多返回 100 行，需分页。"""
+        return self.call(
+            "fina_indicator",
+            {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+            FINA_INDICATOR_FIELDS,
+            page_size=100,
         )

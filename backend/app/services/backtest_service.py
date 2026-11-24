@@ -33,7 +33,12 @@ from app.backtest.engine import BacktestEngine
 from app.backtest.audit.runner import config_from_manifest, run_parameter_audit
 from app.backtest.audit.trials import TrialLedger
 from app.backtest.metrics import compute_metrics, json_safe
-from app.backtest.models import BacktestConfig, BacktestResult
+from app.backtest.models import (
+    COOLDOWN_MODES,
+    REBALANCE_MODES,
+    BacktestConfig,
+    BacktestResult,
+)
 from app.backtest.result_store import ResultStore
 from app.backtest.strategies import build_strategy
 
@@ -100,8 +105,14 @@ class BacktestService:
         manifest["started_at"] = _now()
         self.store.write_manifest(run_id, manifest)
 
-        panel = load_panel(self._repository, self._calendar, config)
-        engine = BacktestEngine(panel, build_strategy(config.strategy), config)
+        strategy = build_strategy(config.strategy)
+        panel = load_panel(
+            self._repository,
+            self._calendar,
+            config,
+            need_flow=strategy.requires_flow,
+        )
+        engine = BacktestEngine(panel, strategy, config)
         output = engine.run()
         metrics = compute_metrics(
             output.nav,
@@ -163,7 +174,7 @@ class BacktestService:
             ok=True,
             source="backtest",
             as_of=str(manifest.get("created_at") or _now()),
-            stale=False,
+            stale=bool(manifest.get("stale_data")),
             warnings=list(manifest.get("warnings") or []),
             data=BacktestRunDetail(run_id=run_id, manifest=manifest, metrics=metrics),
         )
@@ -176,7 +187,7 @@ class BacktestService:
             ok=True,
             source="backtest",
             as_of=str(manifest.get("created_at") or _now()),
-            stale=False,
+            stale=bool(manifest.get("stale_data")),
             warnings=[],
             data=BacktestRunStatus(
                 run_id=run_id,
@@ -223,7 +234,7 @@ class BacktestService:
             ok=True,
             source="backtest",
             as_of=str(audit["created_at"]),
-            stale=False,
+            stale=bool(manifest.get("stale_data")),
             warnings=list(audit.get("reasons") or []),
             data=BacktestAuditData(run_id=run_id, audit=audit),
         )
@@ -239,7 +250,7 @@ class BacktestService:
             ok=True,
             source="backtest",
             as_of=str(audit.get("created_at") or _now()),
-            stale=False,
+            stale=bool(manifest.get("stale_data")),
             warnings=list(audit.get("reasons") or []),
             data=BacktestAuditData(run_id=run_id, audit=audit),
         )
@@ -269,25 +280,25 @@ class BacktestService:
         )
 
     def get_nav(self, run_id: str) -> Envelope[BacktestNavData]:
-        self._ensure_exists(run_id)
+        manifest = self._manifest(run_id)
         frame = self.store.load_nav(run_id)
         return Envelope(
             ok=True,
             source="backtest",
-            as_of=self._as_of(run_id),
-            stale=False,
+            as_of=self._as_of(manifest),
+            stale=bool(manifest.get("stale_data")),
             warnings=[],
             data=BacktestNavData(run_id=run_id, items=_records(frame)),
         )
 
     def get_trades(self, run_id: str) -> Envelope[BacktestTradeData]:
-        self._ensure_exists(run_id)
+        manifest = self._manifest(run_id)
         frame = self.store.load_trades(run_id)
         return Envelope(
             ok=True,
             source="backtest",
-            as_of=self._as_of(run_id),
-            stale=False,
+            as_of=self._as_of(manifest),
+            stale=bool(manifest.get("stale_data")),
             warnings=[],
             data=BacktestTradeData(run_id=run_id, items=_records(frame)),
         )
@@ -309,6 +320,24 @@ class BacktestService:
             raise InvalidParamError("maxIndustry 必须在 (0, 1] 区间")
         if request.max_turnover is not None and not 0 < request.max_turnover <= 1:
             raise InvalidParamError("maxTurnover 必须在 (0, 1] 区间")
+        if not 0 <= request.stop_loss < 1:
+            raise InvalidParamError("stopLoss 必须在 [0, 1) 区间，0 表示关闭")
+        if request.take_profit < 0:
+            raise InvalidParamError("takeProfit 必须大于等于 0，0 表示关闭")
+        if request.atr_window < 2:
+            raise InvalidParamError("atrWindow 必须大于等于 2")
+        if request.atr_take_profit < 0:
+            raise InvalidParamError("atrTakeProfit 必须大于等于 0，0 表示关闭")
+        if str(request.stop_cooldown).strip().lower() not in COOLDOWN_MODES:
+            raise InvalidParamError(
+                f"stopCooldown 必须是 {', '.join(COOLDOWN_MODES)} 之一"
+            )
+        rebalance = str(request.rebalance or "daily").strip().lower()
+        if rebalance not in REBALANCE_MODES:
+            raise InvalidParamError(
+                f"rebalance 必须是 {' / '.join(REBALANCE_MODES)}",
+                detail={"rebalance": request.rebalance},
+            )
 
         symbols = None
         if request.symbols:
@@ -334,6 +363,12 @@ class BacktestService:
                 if request.max_turnover is not None
                 else None
             ),
+            rebalance=rebalance,
+            stop_loss=float(request.stop_loss),
+            take_profit=float(request.take_profit),
+            atr_window=int(request.atr_window),
+            atr_take_profit=float(request.atr_take_profit),
+            stop_cooldown=str(request.stop_cooldown).strip().lower(),
         )
 
     # ---- 产物 ----
@@ -371,6 +406,7 @@ class BacktestService:
                 "data_origin": None,
                 "data_latest": self._repository.latest_date("daily"),
                 "mode": self._settings.mode.value,
+                "stale_data": False,
                 "git_commit": _git_commit(self._settings.root_dir),
                 "config": config.as_dict(),
                 "warnings": [],
@@ -398,6 +434,7 @@ class BacktestService:
                 "final_value": metrics.get("final_value"),
                 "data_origin": panel.origin,
                 "data_latest": self._repository.latest_date("daily"),
+                "stale_data": bool(panel.stale_data),
                 "warnings": list(output.warnings),
                 "metrics_summary": {
                     "total_return": metrics.get("total_return"),
@@ -417,7 +454,7 @@ class BacktestService:
             ok=True,
             source="backtest",
             as_of=str(manifest.get("created_at") or _now()),
-            stale=False,
+            stale=bool(manifest.get("stale_data")),
             warnings=list(manifest.get("warnings") or []),
             data=self._summary(manifest),
         )
@@ -442,12 +479,14 @@ class BacktestService:
             warnings=list(manifest.get("warnings") or []),
         )
 
-    def _ensure_exists(self, run_id: str) -> None:
-        if not self.store.exists(run_id):
+    def _manifest(self, run_id: str) -> dict[str, Any]:
+        manifest = self.store.load_manifest(run_id)
+        if manifest is None:
             raise RunNotFoundError(f"回测记录不存在：{run_id}", detail={"run_id": run_id})
+        return manifest
 
-    def _as_of(self, run_id: str) -> str:
-        manifest = self.store.load_manifest(run_id) or {}
+    @staticmethod
+    def _as_of(manifest: dict[str, Any]) -> str:
         return str(
             manifest.get("created_at")
             or datetime.now().astimezone().isoformat(timespec="seconds")

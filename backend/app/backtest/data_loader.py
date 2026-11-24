@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from app.core.errors import DataNotReadyError
@@ -54,10 +55,7 @@ class BarContext:
 
     def history_window(self, days: int = 90) -> pd.DataFrame:
         """截至 date 的最近 days 个交易日长表（按日期升序）。"""
-        window = [day for day in self.panel.dates if day <= self.date][-max(1, days):]
-        if not window:
-            return pd.DataFrame()
-        return self.panel.bars[self.panel.bars["trade_date"].isin(window)]
+        return self.panel.window_bars(days, self.date)
 
     def daily_basic(self) -> pd.DataFrame:
         return self.panel.daily_basic.get(self.date, pd.DataFrame())
@@ -67,6 +65,10 @@ class BarContext:
 
     def index_return_20(self) -> float | None:
         return self.panel.index_returns.get(self.date)
+
+    def index_closes(self) -> pd.Series:
+        """截至 date 的沪深 300 收盘价（含回测窗口前的预热点）。"""
+        return self.panel.index_closes.loc[: self.date]
 
     def stock_basic(self) -> pd.DataFrame:
         return self.panel.stock_basic
@@ -94,6 +96,7 @@ class Panel:
         stock_basic: pd.DataFrame | None = None,
         trading_age: dict[str, int] | None = None,
         benchmark: pd.DataFrame | None = None,
+        index_closes: pd.Series | None = None,
         adj_missing_rate: float = 0.0,
     ) -> None:
         self.bars = bars
@@ -106,6 +109,9 @@ class Panel:
         self.daily_basic = daily_basic or {}
         self.moneyflow = moneyflow or {}
         self.index_returns = index_returns or {}
+        self.index_closes = (
+            index_closes if index_closes is not None else pd.Series(dtype="float64")
+        )
         self.trading_age = trading_age or {}
         self.benchmark = (
             benchmark
@@ -116,6 +122,7 @@ class Panel:
         self.by_code: dict[str, pd.DataFrame] = {
             code: frame for code, frame in bars.groupby("ts_code")
         }
+        self._date_spans: dict[str, tuple[int, int]] = self._build_date_spans(bars)
         if stock_basic is None or stock_basic.empty:
             columns = [
                 column
@@ -133,6 +140,37 @@ class Panel:
         else:
             self.industry_map = {}
 
+    @property
+    def stale_data(self) -> bool:
+        """复权因子覆盖率低于 99% 时标记数据陈旧（见 §4.3）。"""
+        return self.adj_missing_rate > 0.01
+
+    def window_bars(self, days: int, date: str) -> pd.DataFrame:
+        """截至 date 的最近 days 个交易日长表，按全局行号切片避免整表拷贝。"""
+        window = [day for day in self.dates if day <= date][-max(1, days):]
+        if not window:
+            return self.bars.iloc[0:0]
+        start = self._date_spans.get(window[0])
+        last = self._date_spans.get(window[-1])
+        if start is not None and last is not None:
+            return self.bars.iloc[start[0] : last[1]]
+        return self.bars[self.bars["trade_date"].isin(window)]
+
+    @staticmethod
+    def _build_date_spans(bars: pd.DataFrame) -> dict[str, tuple[int, int]]:
+        """行情按 trade_date 全局排序时，记录每个交易日的行区间。"""
+        if bars.empty:
+            return {}
+        values = bars["trade_date"].astype(str).to_numpy()
+        if len(values) > 1 and not (values[1:] >= values[:-1]).all():
+            return {}
+        starts = np.flatnonzero(np.r_[True, values[1:] != values[:-1]])
+        ends = np.r_[starts[1:], len(values)]
+        return {
+            str(values[start]): (int(start), int(end))
+            for start, end in zip(starts, ends)
+        }
+
     # ---- 构造 ----
 
     @classmethod
@@ -149,6 +187,7 @@ class Panel:
         index_returns: dict[str, float] | None = None,
         stock_basic: pd.DataFrame | None = None,
         benchmark: pd.DataFrame | None = None,
+        index_closes: pd.Series | None = None,
         adj_missing_rate: float = 0.0,
     ) -> "Panel":
         if bars.empty:
@@ -157,7 +196,7 @@ class Panel:
         frame = bars.copy()
         frame["trade_date"] = frame["trade_date"].astype(str)
         frame = frame.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
-        frame = frame.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+        frame = frame.sort_values(["trade_date", "ts_code"]).reset_index(drop=True)
         for column in ("open", "high", "low", "close", "pre_close", "vol", "amount"):
             if column not in frame.columns:
                 frame[column] = float("nan")
@@ -173,7 +212,7 @@ class Panel:
         symbols = sorted(frame["ts_code"].unique().tolist())
 
         pivot: dict[str, pd.DataFrame] = {}
-        for column in ("open", "close", "pre_close", "vol", "amount", "open_hfq", "close_hfq"):
+        for column in ("open", "high", "low", "close", "pre_close", "vol", "amount", "open_hfq", "close_hfq", "adj_factor"):
             pivot[column] = (
                 frame.pivot(index="trade_date", columns="ts_code", values=column)
                 .sort_index()
@@ -195,6 +234,7 @@ class Panel:
             stock_basic=stock_basic,
             trading_age=trading_age,
             benchmark=benchmark,
+            index_closes=index_closes,
             adj_missing_rate=adj_missing_rate,
         )
 
@@ -248,6 +288,54 @@ class Panel:
             return None
         return matched.iloc[-1]
 
+    def adj_factor(self, date: str, ts_code: str) -> float | None:
+        table = self.pivot.get("adj_factor")
+        if table is None or date not in table.index:
+            return None
+        try:
+            value = table.at[date, ts_code]
+        except KeyError:
+            return None
+        if pd.isna(value) or float(value) <= 0:
+            return None
+        return float(value)
+
+    def atr(self, date: str, ts_code: str, window: int = 14) -> float | None:
+        """单只股票截至 date 的 ATR（真实波幅均值），用于 ATR 止盈。"""
+        close_table = self.pivot.get("close")
+        high_table = self.pivot.get("high")
+        low_table = self.pivot.get("low")
+        if (
+            close_table is None
+            or high_table is None
+            or low_table is None
+            or ts_code not in close_table.columns
+        ):
+            return None
+        try:
+            position = close_table.index.get_loc(date)
+        except KeyError:
+            return None
+        if position < window:
+            return None
+        start = position - window
+        closes = close_table.iloc[start : position + 1][ts_code].to_numpy(dtype=float)
+        highs = high_table.iloc[start : position + 1][ts_code].to_numpy(dtype=float)
+        lows = low_table.iloc[start : position + 1][ts_code].to_numpy(dtype=float)
+        if np.isnan(closes).any() or np.isnan(highs).any() or np.isnan(lows).any():
+            return None
+        previous = closes[:-1]
+        true_range = np.maximum.reduce(
+            [
+                highs[1:] - lows[1:],
+                np.abs(highs[1:] - previous),
+                np.abs(lows[1:] - previous),
+            ]
+        )
+        if true_range.size == 0:
+            return None
+        return float(true_range.mean())
+
     def open_prices(self, date: str) -> dict[str, float]:
         return self._prices("open", date)
 
@@ -287,6 +375,8 @@ def load_panel(
     repository: Repository,
     calendar: TradeCalendar,
     config: BacktestConfig,
+    *,
+    need_flow: bool = True,
 ) -> Panel:
     """按起止日期装载日线、复权因子与股票基础信息，并做股票池过滤。"""
     warnings: list[str] = []
@@ -322,12 +412,18 @@ def load_panel(
         frames.append(frame)
         origins.add(loaded.origin)
 
-        basic = repository.read_dataset("daily_basic", day)
-        if basic is not None and not basic.frame.empty:
-            daily_basic[day] = coerce_numeric(basic.frame)
-        flow = repository.read_dataset("moneyflow", day)
-        if flow is not None and not flow.frame.empty:
-            moneyflow[day] = coerce_numeric(flow.frame)
+        if need_flow:
+            basic = repository.read_dataset("daily_basic", day)
+            if basic is not None and not basic.frame.empty:
+                daily_basic[day] = _narrow(
+                    coerce_numeric(basic.frame),
+                    ("ts_code", "turnover_rate", "volume_ratio", "pe_ttm", "circ_mv"),
+                )
+            flow = repository.read_dataset("moneyflow", day)
+            if flow is not None and not flow.frame.empty:
+                moneyflow[day] = _narrow(
+                    coerce_numeric(flow.frame), ("ts_code", "net_mf_amount")
+                )
 
     if not frames:
         raise DataNotReadyError("日线读取失败，回测面板为空")
@@ -378,9 +474,9 @@ def load_panel(
     origin = "sample" if "sample" in origins else "raw"
     if origin == "sample":
         warnings.append("当前使用离线样本数据，回测结果仅用于功能验证")
-    if not daily_basic:
+    if need_flow and not daily_basic:
         warnings.append("缺少 daily_basic，换手率与量比按量能近似")
-    if not moneyflow:
+    if need_flow and not moneyflow:
         warnings.append("缺少 moneyflow，资金流因子按中性处理")
 
     index_prices = _load_index_closes(repository, dates, warnings)
@@ -398,6 +494,7 @@ def load_panel(
         index_returns=index_returns,
         stock_basic=basic_frame,
         benchmark=benchmark,
+        index_closes=index_prices,
         adj_missing_rate=adj_missing_rate,
     )
 
@@ -405,14 +502,20 @@ def load_panel(
 INDEX_CODE = "000300.SH"
 
 
+def _narrow(frame: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
+    """只保留策略真正使用的列，降低多年回测的常驻内存。"""
+    keep = [column for column in columns if column in frame.columns]
+    return frame[keep].copy()
+
+
 def _load_index_closes(
     repository: Repository,
     dates: list[str],
     warnings: list[str],
 ) -> pd.Series:
-    """读取回测窗口前后的沪深 300 收盘价，供相对强度与基准对比使用。"""
+    """读取回测窗口前后的沪深 300 收盘价，供相对强度、基准对比与市场状态判断使用。"""
     available = [day for day in repository.available_dates("index_daily") if day <= dates[-1]]
-    window = available[-(len(dates) + 25):]
+    window = available[-(len(dates) + 280):]
     closes: dict[str, float] = {}
     for day in window:
         loaded = repository.read_dataset("index_daily", day)

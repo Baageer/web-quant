@@ -51,6 +51,7 @@ def _hfq_view(frame: pd.DataFrame) -> pd.DataFrame:
 
 class SignalRuleStrategy:
     name = "signal_rule"
+    requires_flow = False
 
     def __init__(self) -> None:
         self.params: dict = dict(DEFAULT_PARAMS)

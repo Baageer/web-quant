@@ -311,10 +311,17 @@ export interface BacktestRequest {
   strategy: string;
   params: Record<string, unknown>;
   initialCash?: number;
+  symbols?: string[];
   maxPositions?: number;
   maxPosition?: number;
   maxIndustry?: number;
   maxTurnover?: number | null;
+  rebalance?: string;
+  stopLoss?: number;
+  takeProfit?: number;
+  atrWindow?: number;
+  atrTakeProfit?: number;
+  stopCooldown?: string;
 }
 
 export interface BacktestRunSummary {
@@ -330,6 +337,22 @@ export interface BacktestRunSummary {
   totalReturn: number;
   tradeCount: number;
   warnings: string[];
+}
+
+export interface BacktestRunListItem {
+  runId: string;
+  strategy: string;
+  startDate: string;
+  endDate: string;
+  createdAt?: string | null;
+  status: string;
+  totalReturn: number | null;
+  tradeCount: number | null;
+}
+
+export interface BacktestRunList {
+  total: number;
+  items: BacktestRunListItem[];
 }
 
 export interface BacktestRunStatus {

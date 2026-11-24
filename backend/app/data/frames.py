@@ -37,6 +37,19 @@ NUMERIC_COLUMNS = {
     "limit",
     "limit_times",
     "up_stat",
+    "roe",
+    "roe_waa",
+    "roe_dt",
+    "roe_yearly",
+    "roa",
+    "roic",
+    "grossprofit_margin",
+    "netprofit_margin",
+    "debt_to_assets",
+    "current_ratio",
+    "quick_ratio",
+    "netprofit_yoy",
+    "or_yoy",
 }
 
 

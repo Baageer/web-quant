@@ -26,20 +26,30 @@ import type {
   BacktestAuditTrial,
   BacktestMetrics,
   BacktestNavPoint,
+  BacktestRunListItem,
   BacktestTrade,
 } from "../../api/types";
 
 const STRATEGY_OPTIONS = [
   { value: "ma_cross", label: "双均线（ma_cross）" },
+  { value: "multi_factor", label: "多因子（multi_factor）" },
   { value: "radar_topk", label: "雷达选股（radar_topk）" },
   { value: "signal_rule", label: "信号评分（signal_rule）" },
 ];
 
 const DEFAULT_PARAMS: Record<string, string> = {
   ma_cross: '{"fast": 5, "slow": 20}',
+  multi_factor:
+    '{"top_k": 50, "weight_value": 0.25, "weight_vol": 0.4, "weight_rev": 0.35, "market_filter": true, "risk_off_weight": 0.5}',
   radar_topk: '{"top_k": 10, "min_score": 50}',
   signal_rule: '{"min_score": 30}',
 };
+
+const REBALANCE_OPTIONS = [
+  { value: "daily", label: "每日" },
+  { value: "weekly", label: "每周" },
+  { value: "monthly", label: "每月" },
+];
 
 const DEFAULT_THRESHOLDS = '{"pbo_max": 0.5, "dsr_min": 0.95, "cpcv_positive_min": 0.5}';
 
@@ -450,6 +460,14 @@ export default function BacktestPage() {
   const [initialCash, setInitialCash] = useState(1_000_000);
   const [maxPositions, setMaxPositions] = useState(10);
   const [maxPosition, setMaxPosition] = useState(0.1);
+  const [maxIndustry, setMaxIndustry] = useState(0.3);
+  const [maxTurnover, setMaxTurnover] = useState<number | null>(null);
+  const [stopLossPct, setStopLossPct] = useState(0);
+  const [atrMultiple, setAtrMultiple] = useState(2);
+  const [atrWindow, setAtrWindow] = useState(14);
+  const [stopCooldown, setStopCooldown] = useState("none");
+  const [symbolsText, setSymbolsText] = useState("");
+  const [rebalance, setRebalance] = useState("daily");
   const [paramsText, setParamsText] = useState(DEFAULT_PARAMS.ma_cross);
   const [runId, setRunId] = useState<string>();
   const [submitting, setSubmitting] = useState(false);
@@ -506,11 +524,81 @@ export default function BacktestPage() {
   const trades = tradesQuery.data?.data.items ?? [];
   const audit = localAudit !== undefined ? localAudit : auditQuery.data?.data.audit;
 
+  const runsQuery = useQuery({
+    queryKey: ["backtest-runs"],
+    queryFn: () => api.backtestRuns(50, 0),
+    staleTime: 10_000,
+  });
+  const runs = runsQuery.data?.data.items ?? [];
+
+  useEffect(() => {
+    if (status === "completed" || status === "failed") {
+      queryClient.invalidateQueries({ queryKey: ["backtest-runs"] });
+    }
+  }, [status, runId, queryClient]);
+
+  function handleSelectRun(nextRunId: string) {
+    setRunId(nextRunId);
+    setLocalAudit(undefined);
+  }
+
+  const historyColumns: ColumnsType<BacktestRunListItem> = [
+    {
+      title: "运行 ID",
+      dataIndex: "runId",
+      render: (value: string) => (
+        <Button type="link" size="small" style={{ padding: 0 }} onClick={() => handleSelectRun(value)}>
+          {value}
+        </Button>
+      ),
+    },
+    { title: "策略", dataIndex: "strategy", width: 120 },
+    {
+      title: "区间",
+      key: "range",
+      width: 190,
+      render: (_, record) => `${record.startDate} ~ ${record.endDate}`,
+    },
+    {
+      title: "状态",
+      dataIndex: "status",
+      width: 90,
+      render: (value: string) => (
+        <Tag color={STATUS_COLORS[value] ?? "default"}>
+          {STATUS_LABELS[value] ?? value}
+        </Tag>
+      ),
+    },
+    {
+      title: "收益",
+      dataIndex: "totalReturn",
+      width: 90,
+      align: "right",
+      render: (value: number | null) => (value == null ? "-" : fmtPct(value)),
+    },
+    {
+      title: "成交数",
+      dataIndex: "tradeCount",
+      width: 80,
+      align: "right",
+      render: (value: number | null) => (value == null ? "-" : value),
+    },
+    {
+      title: "创建时间",
+      dataIndex: "createdAt",
+      width: 160,
+      render: (value?: string | null) =>
+        value ? value.slice(0, 19).replace("T", " ") : "-",
+    },
+  ];
+
   function handleStrategyChange(value: string) {
     setStrategy(value);
     setParamsText(DEFAULT_PARAMS[value] ?? "{}");
     if (value === "ma_cross") {
       setGridText('{"fast": [5, 10], "slow": [20, 30]}');
+    } else if (value === "multi_factor") {
+      setGridText('{"top_k": [30, 50]}');
     } else if (value === "radar_topk") {
       setGridText('{"top_k": [10, 20]}');
     } else {
@@ -528,6 +616,10 @@ export default function BacktestPage() {
     }
     try {
       setSubmitting(true);
+      const symbols = symbolsText
+        .split(/[,，\s]+/)
+        .map((item) => item.trim().toUpperCase())
+        .filter(Boolean);
       const result = await api.runBacktest({
         startDate,
         endDate,
@@ -536,9 +628,18 @@ export default function BacktestPage() {
         initialCash,
         maxPositions,
         maxPosition,
+        maxIndustry,
+        maxTurnover,
+        symbols: symbols.length > 0 ? symbols : undefined,
+        rebalance,
+        stopLoss: stopLossPct / 100,
+        atrWindow,
+        atrTakeProfit: atrMultiple,
+        stopCooldown,
       });
       setRunId(result.data.runId);
       setLocalAudit(undefined);
+      await queryClient.invalidateQueries({ queryKey: ["backtest-runs"] });
       message.success(`回测已提交：${result.data.runId}`);
     } catch (error) {
       message.error(error instanceof Error ? error.message : "回测提交失败");
@@ -691,6 +792,92 @@ export default function BacktestPage() {
               onChange={(value) => setMaxPosition(value ?? 0.1)}
             />
           </div>
+          <div>
+            <div className="metric-label">行业上限</div>
+            <InputNumber
+              value={maxIndustry}
+              min={0.05}
+              max={1}
+              step={0.05}
+              style={{ width: 110 }}
+              onChange={(value) => setMaxIndustry(value ?? 0.3)}
+            />
+          </div>
+          <div>
+            <div className="metric-label">换手上限</div>
+            <InputNumber
+              value={maxTurnover}
+              min={0.05}
+              max={1}
+              step={0.05}
+              placeholder="不限"
+              style={{ width: 110 }}
+              onChange={(value) => setMaxTurnover(value ?? null)}
+            />
+          </div>
+          <div style={{ flex: 1, minWidth: 220 }}>
+            <div className="metric-label">指定标的（可选）</div>
+            <Input
+              value={symbolsText}
+              placeholder="逗号分隔，如 600000.SH,000001.SZ"
+              onChange={(event) => setSymbolsText(event.target.value)}
+            />
+          </div>
+          <div>
+            <div className="metric-label">止损（%）</div>
+            <InputNumber
+              value={stopLossPct}
+              min={0}
+              max={90}
+              step={1}
+              style={{ width: 110 }}
+              onChange={(value) => setStopLossPct(value ?? 0)}
+            />
+          </div>
+          <div>
+            <div className="metric-label">ATR 止盈倍数</div>
+            <InputNumber
+              value={atrMultiple}
+              min={0}
+              max={10}
+              step={0.5}
+              style={{ width: 110 }}
+              onChange={(value) => setAtrMultiple(value ?? 0)}
+            />
+          </div>
+          <div>
+            <div className="metric-label">ATR 周期</div>
+            <InputNumber
+              value={atrWindow}
+              min={2}
+              max={60}
+              step={1}
+              style={{ width: 110 }}
+              onChange={(value) => setAtrWindow(value ?? 14)}
+            />
+          </div>
+          <div>
+            <div className="metric-label">止损后冷却</div>
+            <Select
+              value={stopCooldown}
+              style={{ width: 120 }}
+              options={[
+                { value: "none", label: "不限制" },
+                { value: "week", label: "本周内" },
+                { value: "month", label: "本月内" },
+              ]}
+              onChange={(value) => setStopCooldown(value)}
+            />
+          </div>
+          <div>
+            <div className="metric-label">调仓频率</div>
+            <Select
+              value={rebalance}
+              options={REBALANCE_OPTIONS}
+              style={{ width: 110 }}
+              onChange={setRebalance}
+            />
+          </div>
           <div style={{ flex: 1, minWidth: 260 }}>
             <div className="metric-label">策略参数 JSON</div>
             <Input
@@ -704,12 +891,41 @@ export default function BacktestPage() {
         </Space>
       </Card>
 
+      <Card
+        size="small"
+        title="历史回测"
+        extra={
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            共 {runsQuery.data?.data.total ?? 0} 条
+          </Typography.Text>
+        }
+      >
+        <Table<BacktestRunListItem>
+          size="small"
+          rowKey="runId"
+          columns={historyColumns}
+          dataSource={runs}
+          loading={runsQuery.isLoading}
+          pagination={{ pageSize: 10, size: "small", hideOnSinglePage: true }}
+          locale={{ emptyText: "暂无历史回测" }}
+        />
+      </Card>
+
       {status === "failed" ? (
         <Alert
           type="error"
           showIcon
           message="回测失败"
           description={statusQuery.data?.data.error ?? "未知错误"}
+        />
+      ) : null}
+
+      {completed && detailQuery.data?.stale ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="数据质量提示"
+          description="复权因子覆盖率低于 99%，本次回测结果已标记为 stale，请谨慎解读。"
         />
       ) : null}
 

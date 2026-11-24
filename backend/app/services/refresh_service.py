@@ -83,6 +83,131 @@ class RefreshService:
         self._calendar.reload()
         return {"dataset": "trade_cal", "status": "ok", "rows": int(len(frame))}
 
+    # ---- 财务数据 ----
+
+    def refresh_fina_indicator(
+        self,
+        start_year: int,
+        end_year: int,
+        *,
+        force: bool = False,
+    ) -> list[dict]:
+        """逐股票拉取财务指标（ROE / 毛利率 / 负债率等），再按报告期落盘。
+
+        fina_indicator 要求必须指定 ts_code，单页最多 100 行，因此按股票分页拉取。
+        同一 (ts_code, end_date) 若有多条公告，保留最早公告，避免把后续更正的数据
+        提前使用（point-in-time 保守处理）。
+        """
+        periods = [
+            f"{year}{suffix}"
+            for year in range(start_year, end_year + 1)
+            for suffix in ("0331", "0630", "0930", "1231")
+        ]
+        results: list[dict] = []
+        pending: list[str] = []
+        for period in periods:
+            existing = self._repository.get_manifest("fina_indicator", period)
+            if (
+                not force
+                and existing
+                and existing["layer"] == "raw"
+                and bool(existing["complete"])
+            ):
+                results.append(
+                    {
+                        "dataset": "fina_indicator",
+                        "period": period,
+                        "status": "skipped",
+                        "rows": existing["rows"],
+                    }
+                )
+            else:
+                pending.append(period)
+        if not pending:
+            return results
+
+        basic = self._repository.read_stock_basic()
+        if basic is None or basic.frame.empty:
+            raise TushareConfigError("缺少 stock_basic，无法按股票拉取财务数据")
+        codes = sorted(basic.frame["ts_code"].astype(str).unique())
+        start_date = f"{start_year - 1}1201"
+        end_date = f"{end_year}1231"
+
+        client = self._get_client()
+        frames: list[pd.DataFrame] = []
+        failures = 0
+        for index, code in enumerate(codes, 1):
+            try:
+                frame = client.fina_indicator(code, start_date, end_date)
+            except Exception as exc:
+                failures += 1
+                logger.warning("fina_indicator %s 拉取失败：%s", code, exc)
+                continue
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+            if index % 200 == 0:
+                logger.info(
+                    "财务数据进度 %s/%s，已获取 %s 只，失败 %s 只",
+                    index,
+                    len(codes),
+                    len(frames),
+                    failures,
+                )
+
+        if not frames:
+            results.extend(
+                {
+                    "dataset": "fina_indicator",
+                    "period": period,
+                    "status": "failed",
+                    "error": "no_data",
+                }
+                for period in pending
+            )
+            return results
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged = coerce_numeric(merged)
+        merged["ann_date"] = merged["ann_date"].astype(str)
+        merged["end_date"] = merged["end_date"].astype(str)
+        merged = merged[merged["ann_date"].str.len() == 8]
+        merged = (
+            merged.sort_values(["ts_code", "ann_date", "end_date"])
+            .drop_duplicates(["ts_code", "end_date"], keep="first")
+            .reset_index(drop=True)
+        )
+
+        for period in pending:
+            frame = merged[merged["end_date"] == period].reset_index(drop=True)
+            if frame.empty:
+                results.append(
+                    {
+                        "dataset": "fina_indicator",
+                        "period": period,
+                        "status": "skipped",
+                        "rows": 0,
+                    }
+                )
+                continue
+            run_id = uuid.uuid4().hex
+            self._repository.record_refresh_start(run_id, "fina_indicator", period)
+            complete, reason, path = self._repository.write_dataset(
+                "fina_indicator", period, frame, allow_empty=True
+            )
+            status = "ok" if complete else "incomplete"
+            self._repository.record_refresh_finish(run_id, status, reason)
+            results.append(
+                {
+                    "dataset": "fina_indicator",
+                    "period": period,
+                    "status": status,
+                    "rows": int(len(frame)),
+                    "reason": reason,
+                    "path": str(path),
+                }
+            )
+        return results
+
     # ---- 日频数据 ----
 
     def refresh_date(

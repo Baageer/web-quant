@@ -23,7 +23,7 @@ from app.data.calendar import TradeCalendar  # noqa: E402
 from app.data.repository import Repository  # noqa: E402
 from app.services.refresh_service import RefreshService  # noqa: E402
 
-CAL_START = "20150101"
+CAL_START = "20100101"
 CAL_END = "20301231"
 
 
@@ -36,6 +36,13 @@ def main() -> int:
         "--datasets",
         nargs="*",
         help="数据集列表：daily daily_basic adj_factor index_daily moneyflow limit_list",
+    )
+    parser.add_argument(
+        "--fina",
+        nargs=2,
+        type=int,
+        metavar=("START_YEAR", "END_YEAR"),
+        help="下载财务指标 fina_indicator（含公告日），如 --fina 2009 2025",
     )
     parser.add_argument("--force", action="store_true", help="忽略已有完整数据强制刷新")
     parser.add_argument("--skip-basic", action="store_true", help="跳过 stock_basic / trade_cal")
@@ -52,11 +59,18 @@ def main() -> int:
             results.append(refresh.refresh_stock_basic())
             results.append(refresh.refresh_trade_cal(CAL_START, CAL_END))
 
+        if args.fina:
+            results.extend(
+                refresh.refresh_fina_indicator(
+                    args.fina[0], args.fina[1], force=args.force
+                )
+            )
+
         if args.start or args.end:
             start = args.start or calendar.latest_trade_date()
             end = args.end or calendar.latest_trade_date()
             results.extend(refresh.bootstrap(start, end, args.datasets, force=args.force))
-        else:
+        elif args.date or not args.fina:
             target = args.date or calendar.latest_trade_date()
             results.extend(refresh.refresh_date(target, args.datasets, force=args.force))
     except AppError as exc:
@@ -65,10 +79,12 @@ def main() -> int:
 
     for item in results:
         dataset = str(item.get("dataset", "?"))
+        if item.get("period"):
+            dataset = f"{dataset}@{item['period']}"
         status = str(item.get("status", "?"))
         rows = item.get("rows", 0)
         extra = item.get("error") or item.get("reason") or ""
-        print(f"{dataset:<12} {status:<10} rows={rows} {extra}".rstrip())
+        print(f"{dataset:<24} {status:<10} rows={rows} {extra}".rstrip())
 
     failures = [item for item in results if item.get("status") == "failed"]
     print(f"完成：{len(results) - len(failures)} 成功，{len(failures)} 失败")

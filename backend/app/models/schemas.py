@@ -342,6 +342,12 @@ class BacktestRequest(CamelModel):
     max_position: float = 0.10
     max_industry: float = 0.30
     max_turnover: float | None = None
+    rebalance: str = "daily"
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    atr_window: int = 14
+    atr_take_profit: float = 0.0
+    stop_cooldown: str = "none"
 
 
 class BacktestRunSummary(CamelModel):

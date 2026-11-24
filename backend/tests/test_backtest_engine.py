@@ -5,6 +5,7 @@ import math
 import pandas as pd
 import pytest
 
+from app.backtest.broker import FeeBreakdown
 from app.backtest.engine import BacktestEngine, LookaheadError
 from app.backtest.data_loader import Panel
 from app.backtest.models import (
@@ -229,6 +230,302 @@ def test_bar_context_hides_future_rows():
         assert str(closes.index.max()) <= dates[10]
         history = ctx.history(code)
         assert history["trade_date"].max() <= dates[10]
+
+
+def test_panel_marks_stale_when_adj_factor_missing():
+    bars = build_bars({"600001.SH": [10.0, 10.0]}, DATES[:2])
+    fresh = Panel.from_bars(bars, universe=None, adj_missing_rate=0.0)
+    stale = Panel.from_bars(bars, universe=None, adj_missing_rate=0.02)
+
+    assert fresh.stale_data is False
+    assert stale.stale_data is True
+
+
+def test_sells_execute_before_buys_to_free_cash():
+    codes = ["600001.SH", "600002.SH", "600003.SH", "600004.SH"]
+    bars = build_bars({code: [10.0] * len(DATES) for code in codes}, DATES)
+    strategy = ScriptedStrategy(
+        {
+            DATES[0]: {"600001.SH": 0.45, "600002.SH": 0.45},
+            DATES[1]: {"600001.SH": 0.45, "600002.SH": 0.45},
+            DATES[2]: {"600003.SH": 0.45, "600004.SH": 0.45},
+            DATES[3]: {"600003.SH": 0.45, "600004.SH": 0.45},
+        }
+    )
+    config = make_config(
+        max_positions=2, max_position=0.5, initial_cash=1_000_000.0
+    )
+
+    output = BacktestEngine(make_panel(bars), strategy, config).run()
+
+    trades = output.trades
+    assert (trades["rejection_reason"] != "insufficient_cash").all()
+    filled = trades[(trades["status"] == "filled") & (trades["date"] == DATES[3])]
+    assert set(filled[filled["action"] == "sell"]["ts_code"]) == {
+        "600001.SH",
+        "600002.SH",
+    }
+    assert set(filled[filled["action"] == "buy"]["ts_code"]) == {
+        "600003.SH",
+        "600004.SH",
+    }
+
+
+def test_buy_notional_scaled_to_available_cash():
+    codes = ["600001.SH", "600002.SH", "600003.SH"]
+    dates = DATES[:4]
+    bars = build_bars({code: [10.0] * len(dates) for code in codes}, dates)
+    strategy = ScriptedStrategy(
+        {
+            dates[0]: {"600001.SH": 0.45, "600002.SH": 0.45},
+            dates[1]: {"600001.SH": 0.45, "600002.SH": 0.45},
+            dates[2]: {"600001.SH": 0.6, "600002.SH": 0.6},
+            dates[3]: {"600001.SH": 0.6, "600002.SH": 0.6},
+        }
+    )
+    config = make_config(
+        start_date=dates[0],
+        end_date=dates[-1],
+        max_positions=2,
+        max_position=0.6,
+        initial_cash=1_000_000.0,
+    )
+
+    output = BacktestEngine(make_panel(bars), strategy, config).run()
+
+    trades = output.trades
+    assert (trades["rejection_reason"] != "insufficient_cash").all()
+    bought = trades[
+        (trades["status"] == "filled")
+        & (trades["action"] == "buy")
+        & (trades["date"] == dates[3])
+        & (trades["ts_code"] == "600001.SH")
+    ]
+    assert len(bought) == 1
+    # 目标加仓 15% 但现金仅剩约 10%，按比例缩量而非整单拒绝
+    assert 0 < bought.iloc[0]["shares"] < 15_000
+    assert output.nav.iloc[-1]["cash"] < 10_000
+
+
+def test_stop_loss_sells_next_open_once():
+    bars = build_bars({"600001.SH": [10.0, 10.0, 8.5, 8.5, 8.5]}, DATES)
+    panel = make_panel(bars)
+    strategy = ScriptedStrategy({day: {"600001.SH": 0.5} for day in DATES})
+    config = make_config(stop_loss=0.1, rebalance="daily")
+
+    output = BacktestEngine(panel, strategy, config).run()
+
+    stops = output.trades[
+        (output.trades["action"] == "sell") & (output.trades["reason"] == "stop_loss")
+    ]
+    assert len(stops) == 1
+    assert stops.iloc[0]["date"] == "20260108"
+    held = output.positions[
+        (output.positions["date"] == "20260108")
+        & (output.positions["ts_code"] == "600001.SH")
+    ]
+    assert held.empty
+
+
+def test_take_profit_sells_next_open():
+    bars = build_bars({"600001.SH": [10.0, 10.0, 11.5, 11.5, 11.5]}, DATES)
+    panel = make_panel(bars)
+    strategy = ScriptedStrategy({day: {"600001.SH": 0.5} for day in DATES})
+    config = make_config(take_profit=0.1, rebalance="daily")
+
+    output = BacktestEngine(panel, strategy, config).run()
+
+    exits = output.trades[
+        (output.trades["action"] == "sell") & (output.trades["reason"] == "take_profit")
+    ]
+    assert len(exits) == 1
+    assert exits.iloc[0]["date"] == "20260108"
+
+
+def test_risk_controls_disabled_by_default():
+    bars = build_bars({"600001.SH": [10.0, 10.0, 8.5, 8.5, 8.5]}, DATES)
+    panel = make_panel(bars)
+    strategy = ScriptedStrategy({day: {"600001.SH": 0.5} for day in DATES})
+    config = make_config(rebalance="daily")
+
+    output = BacktestEngine(panel, strategy, config).run()
+
+    assert not (output.trades["reason"] == "stop_loss").any()
+    assert output.positions.iloc[-1]["shares"] > 0
+
+
+ATR_DATES = [f"202601{day:02d}" for day in range(1, 21)]
+
+
+def test_atr_trailing_take_profit_exits_after_retrace():
+    closes = [10.0, 10.2] * 7 + [10.0] + [12.0, 11.2, 11.2, 11.2, 11.2]
+    bars = build_bars({"600001.SH": closes}, ATR_DATES)
+    panel = make_panel(bars)
+    strategy = ScriptedStrategy({day: {"600001.SH": 0.5} for day in ATR_DATES})
+    config = make_config(
+        start_date=ATR_DATES[0],
+        end_date=ATR_DATES[-1],
+        rebalance="daily",
+        atr_window=14,
+        atr_take_profit=2.0,
+    )
+
+    output = BacktestEngine(panel, strategy, config).run()
+
+    exits = output.trades[output.trades["reason"] == "atr_trailing"]
+    assert len(exits) == 1
+    assert exits.iloc[0]["date"] == ATR_DATES[17]
+    assert exits.iloc[0]["action"] == "sell"
+
+
+def test_atr_take_profit_disabled_by_default():
+    closes = [10.0, 10.2] * 7 + [10.0] + [12.0, 11.2, 11.2, 11.2, 11.2]
+    bars = build_bars({"600001.SH": closes}, ATR_DATES)
+    panel = make_panel(bars)
+    strategy = ScriptedStrategy({day: {"600001.SH": 0.5} for day in ATR_DATES})
+    config = make_config(
+        start_date=ATR_DATES[0], end_date=ATR_DATES[-1], rebalance="daily"
+    )
+
+    output = BacktestEngine(panel, strategy, config).run()
+
+    assert not (output.trades["reason"] == "atr_trailing").any()
+
+
+COOLDOWN_DATES = [
+    "20260105",
+    "20260106",
+    "20260107",
+    "20260108",
+    "20260109",
+    "20260112",
+    "20260113",
+    "20260114",
+    "20260115",
+    "20260116",
+]
+
+
+def _cooldown_run(mode: str):
+    closes = [10.0, 10.0, 8.5, 8.5, 8.5, 8.5, 9.0, 9.0, 9.0, 9.0]
+    bars = build_bars({"600001.SH": closes}, COOLDOWN_DATES)
+    panel = make_panel(bars)
+    strategy = ScriptedStrategy({day: {"600001.SH": 0.5} for day in COOLDOWN_DATES})
+    config = make_config(
+        start_date=COOLDOWN_DATES[0],
+        end_date=COOLDOWN_DATES[-1],
+        rebalance="daily",
+        stop_loss=0.1,
+        stop_cooldown=mode,
+    )
+    return BacktestEngine(panel, strategy, config).run()
+
+
+def _buy_dates(output) -> set[str]:
+    buys = output.trades[
+        (output.trades["action"] == "buy") & (output.trades["status"] == "filled")
+    ]
+    return set(buys["date"])
+
+
+def test_weekly_stop_cooldown_blocks_reentry_within_week():
+    output = _cooldown_run("week")
+
+    stops = output.trades[output.trades["reason"] == "stop_loss"]
+    assert len(stops) == 1
+    buys = _buy_dates(output)
+    assert "20260109" not in buys
+    assert "20260113" in buys
+
+
+def test_no_cooldown_allows_reentry_after_stop():
+    output = _cooldown_run("none")
+
+    buys = _buy_dates(output)
+    assert "20260109" in buys
+
+
+def test_invalid_risk_control_config_rejected():
+    with pytest.raises(ValueError):
+        make_config(stop_loss=1.0)
+    with pytest.raises(ValueError):
+        make_config(take_profit=-0.1)
+    with pytest.raises(ValueError):
+        make_config(atr_window=1)
+    with pytest.raises(ValueError):
+        make_config(atr_take_profit=-0.5)
+    with pytest.raises(ValueError):
+        make_config(stop_cooldown="day")
+
+
+def test_split_adjusts_shares_and_keeps_equity():
+    dates = ["20260105", "20260106"]
+    bars = build_bars({"600001.SH": [10.0, 5.0]}, dates)
+    bars["adj_factor"] = [1.0, 2.0]
+    panel = Panel.from_bars(bars, universe=None, adj_missing_rate=0.0)
+    portfolio = Portfolio(100_000)
+    portfolio.buy("600001.SH", 1000, 10.0, FeeBreakdown())
+    engine = BacktestEngine(panel, ScriptedStrategy({}), make_config())
+
+    engine._adjust_corporate_actions(dates[0], dates[1], portfolio)
+
+    position = portfolio.positions["600001.SH"]
+    assert position.shares == 2000
+    assert position.available == 2000
+    assert portfolio.equity({"600001.SH": 5.0}) == pytest.approx(100_000)
+
+
+def test_no_split_leaves_shares_unchanged():
+    dates = ["20260105", "20260106"]
+    bars = build_bars({"600001.SH": [10.0, 10.5]}, dates)
+    bars["adj_factor"] = [1.0, 1.0]
+    panel = Panel.from_bars(bars, universe=None, adj_missing_rate=0.0)
+    portfolio = Portfolio(100_000)
+    portfolio.buy("600001.SH", 1000, 10.0, FeeBreakdown())
+    engine = BacktestEngine(panel, ScriptedStrategy({}), make_config())
+
+    engine._adjust_corporate_actions(dates[0], dates[1], portfolio)
+
+    assert portfolio.positions["600001.SH"].shares == 1000
+
+
+def test_weekly_rebalance_only_signals_on_week_end():
+    dates = [
+        "20260105", "20260106", "20260107", "20260108", "20260109",
+        "20260112", "20260113", "20260114", "20260115", "20260116",
+    ]
+    bars = build_bars({"600001.SH": [10.0] * len(dates)}, dates)
+    strategy = ScriptedStrategy({day: {"600001.SH": 0.5} for day in dates})
+    config = make_config(
+        start_date=dates[0], end_date=dates[-1], rebalance="weekly"
+    )
+
+    output = BacktestEngine(make_panel(bars), strategy, config).run()
+
+    filled = output.trades[output.trades["status"] == "filled"]
+    assert set(output.trades["signal_date"]) == {"20260109"}
+    assert filled.iloc[0]["date"] == "20260112"
+    assert filled.iloc[0]["action"] == "buy"
+
+
+def test_monthly_rebalance_executes_at_next_month_open():
+    dates = ["20260129", "20260130", "20260202", "20260203"]
+    bars = build_bars({"600001.SH": [10.0] * len(dates)}, dates)
+    strategy = ScriptedStrategy({day: {"600001.SH": 0.5} for day in dates})
+    config = make_config(
+        start_date=dates[0], end_date=dates[-1], rebalance="monthly"
+    )
+
+    output = BacktestEngine(make_panel(bars), strategy, config).run()
+
+    filled = output.trades[output.trades["status"] == "filled"]
+    assert set(output.trades["signal_date"]) == {"20260130"}
+    assert filled.iloc[0]["date"] == "20260202"
+
+
+def test_unknown_rebalance_mode_is_rejected():
+    with pytest.raises(ValueError):
+        make_config(rebalance="hourly")
 
 
 def test_lookahead_error_on_same_day_execution():

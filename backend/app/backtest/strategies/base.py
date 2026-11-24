@@ -14,6 +14,7 @@ class Strategy(Protocol):
     """
 
     name: str
+    requires_flow: bool
 
     def prepare(self, panel: Panel, params: dict) -> None: ...
 
